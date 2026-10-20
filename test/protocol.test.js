@@ -407,23 +407,36 @@ test('replay：损坏事件不中断重放，但记入 issues', () => {
   assert.match(state.issues[1], /answer/)
 })
 
-test('replay：幂等表从行内元数据重建', () => {
+test('replay：幂等表按 scope|key 索引，跨成员同 key 不碰撞', () => {
   const rows = makeRows('room-1')
   rows.push({
     seq: 2,
     kind: 'answer',
     msgId: 'ans-1',
-    from: 'codex',
+    from: 'codex-a',
     digest: 'd',
-    idempotency: { key: 'k-1', hash: 'h-1', receipt: { seq: 2 } },
+    idempotency: { scope: 'room-1|m-a|complete', key: 'same-key', hash: 'h-a', receipt: { seq: 2 } },
     at: 2000,
+  })
+  rows.push({
+    seq: 3,
+    kind: 'answer',
+    msgId: 'ans-2',
+    from: 'codex-b',
+    digest: 'd2',
+    idempotency: { scope: 'room-1|m-b|complete', key: 'same-key', hash: 'h-b', receipt: { seq: 3 } },
+    at: 3000,
   })
 
   const state = replay(rows)
-  const entry = state.idempotency.get('k-1')
-  assert.ok(entry)
-  assert.equal(entry.hash, 'h-1')
-  assert.deepEqual(entry.receipt, { seq: 2 })
+  assert.equal(state.idempotency.size, 2, '两个成员用同一个 key 不能互相覆盖')
+
+  const a = state.idempotency.get('room-1|m-a|complete|same-key')
+  const b = state.idempotency.get('room-1|m-b|complete|same-key')
+  assert.equal(a.hash, 'h-a')
+  assert.equal(b.hash, 'h-b')
+  assert.deepEqual(a.receipt, { seq: 2 })
+  assert.deepEqual(b.receipt, { seq: 3 })
 })
 
 // ---------------------------------------------------------------- 任务选择
