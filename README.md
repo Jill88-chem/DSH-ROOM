@@ -26,6 +26,16 @@
 
 ## 安装
 
+宿主需要 Node.js 24+（使用内置 SQLite 取得跨进程账本独占锁）。SQLite 文件只负责锁，不保存权威业务状态；成员、任务和幂等回执均由 `ledger.jsonl` 重放。账本中间的完整行损坏会停止打开，仅自动修复最后一条未完成写入。
+
+## Codex 外部成员
+
+桥接器位于 [`../dsh-room-bridge`](../dsh-room-bridge/README.md)。在可信本地管理端点 `POST /room?cwd=…&room=…` 先执行 `{"action":"enable-protocol"}`，再执行 `{"action":"issue-enrollment"}`，将返回的一次性 `enrollmentToken` 交给桥接器进程环境。有效期一小时，注册提交后消费；账本只保存摘要。
+
+外部成员注册后出现在成员列表和「发给…」选择器。定向或广播到该成员会生成只读任务，由桥接器领取，完整答案进入房间账本。成员在线状态以最近 30 秒的已认证请求判断。移除外部成员会撤销凭据并保留身份与历史。
+
+本地管理还支持 `revoke-external`（`memberId`）及 `cancel-task`（`taskId`）。外部成员 Bearer 凭据只用于 `/room/self`、任务和消息接口，不能调用管理入口。
+
 **先确认你用的是哪个 profile**——这是最容易踩的坑：
 
 | 你打开的 | profile | 安装方式 |

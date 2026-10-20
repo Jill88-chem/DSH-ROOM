@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { apply, name, inject } from '../lib/index.js'
+import { trackDisposer, disposeHosts } from './lifecycle.js'
 
 // ---------------------------------------------------------------- 假宿主
 
@@ -122,6 +123,7 @@ function makeHost(options) {
     },
     effect(fn) {
       const dispose = fn()
+      trackDisposer(options.cwd, dispose)
       return () => {
         if (typeof dispose === 'function') dispose()
       }
@@ -166,6 +168,7 @@ async function withTempDir(fn) {
   try {
     return await fn(dir)
   } finally {
+    await disposeHosts(dir)
     await rm(dir, { recursive: true, force: true })
   }
 }

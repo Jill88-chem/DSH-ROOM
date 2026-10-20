@@ -29,6 +29,7 @@ import {
   registerExternalMember,
   revokeExternalMember,
   protocolSummary,
+  issueEnrollmentToken,
 } from '../lib/room-protocol.js'
 import { createExternalRoutes, capabilities } from '../lib/http-external.js'
 import { PROTOCOL_VERSION, makeMemberId } from '../lib/protocol.js'
@@ -90,6 +91,22 @@ function fakeReq({ method = 'GET', url = '/', headers = {}, body, remote = '127.
 }
 
 // ---------------------------------------------------------------- 凭据
+
+test('并发注册只消费一次入房凭据，原请求可重放但修改内容不行', async () => {
+  await withRoom(async room => {
+    await ensureProtocolEnabled(room)
+    const issued = await issueEnrollmentToken(room)
+    const original = { registrationId: generateRegistrationId(), memberToken: generateToken(), nick: 'codex',
+      requireEnrollment: true, enrollmentTokenHash: hashToken(issued.enrollmentToken) }
+    const other = { ...original, registrationId: generateRegistrationId(), memberToken: generateToken(), nick: 'other' }
+    const results = await Promise.all([registerExternalMember(room, original), registerExternalMember(room, other)])
+    assert.equal(results[0].ok, true); assert.equal(results[1].code, 'unauthorized')
+    assert.equal((await registerExternalMember(room, original)).duplicate, true)
+    assert.equal((await registerExternalMember(room, { ...original, displayName: 'changed' })).code, 'idempotency-conflict')
+    await revokeExternalMember(room, results[0].memberId)
+    assert.equal((await registerExternalMember(room, original)).code, 'unauthorized')
+  })
+})
 
 test('generateToken：每次不同，长度足够', () => {
   const a = generateToken()
@@ -408,6 +425,7 @@ test('POST /room/register：成功注册，响应含 memberId 但不含 token', 
   await withRoom(async (room) => {
     await ensureProtocolEnabled(room)
     const token = generateToken()
+    const enrollment = await issueEnrollmentToken(room)
 
     const routes = new Map()
     const api = {
@@ -431,7 +449,7 @@ test('POST /room/register：成功注册，响应含 memberId 但不含 token', 
       fakeReq({
         method: 'POST',
         url: '/room/register',
-        headers: { authorization: 'Bearer enroll_abc' },
+        headers: { authorization: `Bearer ${enrollment.enrollmentToken}` },
         body: {
           cwd: room.cwd,
           room: 'default',

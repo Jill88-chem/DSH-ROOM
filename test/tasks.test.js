@@ -81,7 +81,8 @@ async function withTaskRoom(fn, opts = {}) {
           rootAskMsgId: msgId,
           parentAskMsgId: null,
           depth: 0,
-          taskPolicy: { executionMode: 'read-only', maxAttempts: opts.maxAttempts ?? 3 },
+          taskPolicy: { executionMode: opts.executionMode ?? 'read-only', maxAttempts: opts.maxAttempts ?? 3,
+            runTimeoutSeconds: opts.runTimeoutSeconds ?? 1800 },
         })
         if (!normalized.ok) throw new Error(normalized.error)
         await append(normalized.row)
@@ -108,6 +109,62 @@ async function withTaskRoom(fn, opts = {}) {
 }
 
 // ---------------------------------------------------------------- claim
+
+test('并发 complete 使用相同键只写一个答案，不同键只有一个胜出', async () => {
+  await withTaskRoom(async ({ room, memberId, taskId }) => {
+    const claim = await claimTask(room, { memberId })
+    const spec = { memberId, taskId, leaseId: claim.task.leaseId, attempt: 1, digest: '结果', text: '完整结果', idempotencyKey: 'finish' }
+    const results = await Promise.all(Array.from({ length: 8 }, () => completeTask(room, spec)))
+    assert.ok(results.every(r => r.ok && r.seq === results[0].seq))
+    assert.equal(results.filter(r => !r.duplicate).length, 1)
+    assert.equal(room.writer.rows.filter(r => r.kind === 'answer').length, 1)
+    assert.equal((await completeTask(room, { ...spec, idempotencyKey: 'other' })).code, 'task-already-completed')
+  })
+})
+
+test('取消先入队时，并发 complete 不能覆盖 cancelled', async () => {
+  await withTaskRoom(async ({ room, memberId, taskId }) => {
+    const claim = await claimTask(room, { memberId })
+    const [cancel, result] = await Promise.all([
+      cancelTask(room, { taskId }),
+      completeTask(room, { memberId, taskId, leaseId: claim.task.leaseId, attempt: 1, digest: '结果', text: '结果' }),
+    ])
+    assert.equal(cancel.ok, true); assert.equal(result.code, 'task-cancelled')
+    assert.equal(room.writer.rows.filter(r => r.kind === 'answer').length, 0)
+  })
+})
+
+test('旧 claim 重放保留原 lease，不能借用新 attempt；过期 fail 被拒绝', async () => {
+  await withTaskRoom(async ({ room, memberId, taskId }) => {
+    const first = await claimTask(room, { memberId, idempotencyKey: 'old' })
+    await room.writer.run(({ append }) => append({ kind: 'system', tag: 'task-renewed', taskId,
+      visibility: 'internal', leaseId: first.task.leaseId, attempt: 1,
+      leaseExpiresAt: Date.now() - 1, attemptDeadlineAt: Date.now() + 100000 }))
+    assert.equal((await failTask(room, { memberId, taskId, leaseId: first.task.leaseId, attempt: 1, code: 'late' })).code, 'lease-lost')
+    // The next claim lazily expires the abandoned lease and enforces retry backoff.
+    assert.equal((await claimTask(room, { memberId })).task, null)
+    assert.equal(room.protocol.tasks.get(taskId).state, 'queued')
+    assert.ok(room.protocol.tasks.get(taskId).nextEligibleAt > Date.now())
+    await room.writer.run(({ append }) => append({ kind: 'system', tag: 'task-expired', taskId,
+      visibility: 'internal', requeue: true, nextEligibleAt: 0 }))
+    const second = await claimTask(room, { memberId, idempotencyKey: 'new' })
+    assert.equal(second.task.attempt, 2)
+    const replay = await claimTask(room, { memberId, idempotencyKey: 'old' })
+    assert.equal(replay.leaseValid, false); assert.equal(replay.task.attempt, 1)
+    assert.equal(replay.task.leaseId, first.task.leaseId); assert.equal(replay.task.text, '任务正文 1')
+    assert.notEqual(replay.task.leaseId, second.task.leaseId)
+  })
+})
+
+test('硬截止遵循 taskPolicy；写任务租约到期进入 needs_review', async () => {
+  await withTaskRoom(async ({ room, memberId, taskId }) => {
+    const before = Date.now(); const claim = await claimTask(room, { memberId, leaseSeconds: 300 })
+    assert.ok(claim.task.attemptDeadlineAt >= before + 20000 && claim.task.attemptDeadlineAt <= Date.now() + 20000)
+    assert.equal(claim.task.leaseExpiresAt, claim.task.attemptDeadlineAt)
+    await expireLeases(room, claim.task.attemptDeadlineAt + 1)
+    assert.equal(room.protocol.tasks.get(taskId).state, 'needs_review')
+  }, { executionMode: 'workspace-write', runTimeoutSeconds: 20 })
+})
 
 test('claim：领取后进入 running，返回 leaseId/attempt/期限', async () => {
   await withTaskRoom(async ({ room, memberId, taskId }) => {
@@ -463,14 +520,16 @@ test('A1/A10 租约过期：任务回队列；旧批次提交被拒（lease-lost
     const oldAttempt = claim.task.attempt
 
     // 手工把租约拨到过去
-    const state = room.protocol.tasks.get(taskId)
-    state.leaseExpiresAt = Date.now() - 1000
+    await room.writer.run(({ append }) => append({ kind: 'system', tag: 'task-renewed', taskId,
+      leaseId: oldLease, leaseExpiresAt: Date.now() - 1000 }))
 
     const swept = await expireLeases(room)
     assert.equal(swept.expired, 1)
 
     const afterExpire = room.protocol.tasks.get(taskId)
     assert.equal(afterExpire.state, TASK_STATE.QUEUED, '未达上限应回队列')
+    await room.writer.run(({ append }) => append({ kind: 'system', tag: 'task-expired', taskId,
+      requeue: true, nextEligibleAt: 0 }))
 
     // 重新领取，拿到新批次
     const reclaim = await claimTask(room, { memberId, idempotencyKey: 'c-2' })
@@ -503,8 +562,8 @@ test('A1 次数耗尽后过期：转 failed 而不是无限重排', async () => 
       const claim = await claimTask(room, { memberId, idempotencyKey: 'c-1' })
       assert.equal(claim.task.attempt, 1)
 
-      const state = room.protocol.tasks.get(taskId)
-      state.leaseExpiresAt = Date.now() - 1
+      await room.writer.run(({ append }) => append({ kind: 'system', tag: 'task-renewed', taskId,
+        leaseId: claim.task.leaseId, leaseExpiresAt: Date.now() - 1 }))
 
       await expireLeases(room)
       assert.equal(room.protocol.tasks.get(taskId).state, TASK_STATE.FAILED)

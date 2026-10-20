@@ -8,8 +8,10 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm, readFile, mkdir, writeFile, access, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { realpathSync } from 'node:fs'
 
 import { apply } from '../lib/index.js'
+import { trackDisposer, disposeHosts } from './lifecycle.js'
 
 /** 最小假宿主（与 host.test.js 同构，但更小）。 */
 function makeHost(cwd) {
@@ -80,7 +82,7 @@ function makeHost(cwd) {
       register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) },
     },
     on(event, fn) { if (event === 'session/event') listeners.push(fn) },
-    effect(fn) { const d = fn(); return () => { if (typeof d === 'function') d() } },
+    effect(fn) { const d = fn(); trackDisposer(cwd, d); return () => d?.() },
     workspaceRegistry: { list: () => [{ path: cwd, title: 'test' }] },
     sessionQuery: { readSession: () => Promise.resolve({ events: [] }) },
     sessionController: {
@@ -158,6 +160,7 @@ async function withTempDir(fn) {
   try {
     return await fn(dir)
   } finally {
+    await disposeHosts(dir)
     await rm(dir, { recursive: true, force: true })
   }
 }
@@ -260,7 +263,7 @@ test('清单同时列出默认房间与额外房间', async () => {
     const list = await call(host, { url: '/room' })
     const ids = list.json.rooms.map((r) => r.roomId).sort()
     assert.deepEqual(ids, ['default', room.json.roomId].sort())
-    assert.ok(list.json.rooms.every((r) => r.cwd === cwd))
+    assert.ok(list.json.rooms.every((r) => r.cwd === realpathSync.native(cwd)))
   })
 })
 
@@ -874,6 +877,7 @@ test('room_read(seq)：answer 行没有 sourceSeq 时按 (session, turn) 兜底'
     await writeFile(ledgerPath, patched.join('\n') + '\n', 'utf8')
 
     // 另起一个宿主重新加载账本，确保读到的是磁盘上的无 sourceSeq 版本
+    await disposeHosts(cwd)
     const host2 = makeHost(cwd)
     apply(host2.ctx)
     // 复用同一个 sessionId 的会话日志与 agent（agent 的 cwd 靠 host2.makeAgent 挂上）
@@ -937,6 +941,7 @@ test('room_read(seq)：sourceSeq 指向「中途叙述」时跳过它，返回�
     await writeFile(ledgerPath, patched.join('\n') + '\n', 'utf8')
 
     // 新宿主重新加载账本
+    await disposeHosts(cwd)
     const host2 = makeHost(cwd)
     apply(host2.ctx)
     // ⚠️ 先 create 再灌日志：makeAgent 的 create 会把该 session 的日志清空。
@@ -1024,6 +1029,7 @@ test('重启后房间尚未被访问过：room_post 仍写进成员所在的房�
     const sid = m.json.sessionId
 
     // ---- 第二个宿主：内存里没有任何房间（模拟重启后还没打开过房间页）
+    await disposeHosts(cwd)
     const host2 = makeHost(cwd)
     apply(host2.ctx)
 
@@ -1272,6 +1278,7 @@ test('房间加载时给老成员补标题（历史遗留的未命名会话）',
     })
 
     // 第二个宿主：内存清空，等价于"重启后标题丢了"（titles 是新的空 Map）
+    await disposeHosts(cwd)
     const host2 = makeHost(cwd)
     apply(host2.ctx)
     host2.logs.set(m.json.sessionId, [...(host1.logs.get(m.json.sessionId) ?? [])])

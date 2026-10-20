@@ -20,6 +20,17 @@ async function withTempDir(fn) {
   }
 }
 
+test('RoomWriter: 同一路径只有一个持有者，释放后可重新打开', async () => {
+  await withTempDir(async dir => {
+    const path = join(dir, 'ledger.jsonl')
+    const first = new RoomWriter(path); await first.open()
+    const second = new RoomWriter(path)
+    await assert.rejects(second.open(), { code: 'room-in-use' })
+    await first.close()
+    const third = new RoomWriter(path); await third.open(); await third.close()
+  })
+})
+
 test('RoomWriter: 全新账本 seq 从 1 开始', async () => {
   await withTempDir(async (dir) => {
     const writer = new RoomWriter(join(dir, 'ledger.jsonl'))
@@ -188,7 +199,7 @@ test('人类原文不截断（T8 的存储侧）', async () => {
   })
 })
 
-test('损坏行被跳过，前后完整行仍可读', async () => {
+test('中间损坏行阻止打开账本，保留原文件供修复', async () => {
   await withTempDir(async (dir) => {
     const path = join(dir, 'ledger.jsonl')
     await writeFile(
@@ -197,9 +208,9 @@ test('损坏行被跳过，前后完整行仍可读', async () => {
       'utf8',
     )
     const writer = new RoomWriter(path)
-    const { rows } = await writer.open()
-    await writer.close()
-    assert.deepEqual(rows.map((r) => r.seq), [1, 2])
+    const before = await readFile(path, 'utf8')
+    await assert.rejects(writer.open(), { code: 'ledger-corrupt' })
+    assert.equal(await readFile(path, 'utf8'), before)
   })
 })
 

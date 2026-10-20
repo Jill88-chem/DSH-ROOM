@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=24.0.0" },
   "description": "多 AI 会话室：一个工作区一个房间，人类定向发送、AI 结果自动回填、账本落盘可恢复。",
   "keywords": ["deepseek", "harness", "dsh", "cordis", "plugin", "room", "multi-agent"],
   "license": "MIT",
