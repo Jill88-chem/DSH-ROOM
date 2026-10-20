@@ -1,0 +1,9 @@
+# 统一行尾，避免 Windows 提交后 Linux/macOS 全是改动
+* text=auto eol=lf
+
+# 明确二进制
+*.png binary
+*.jpg binary
+*.zstd binary
+*.exe binary
+*.dll binary
